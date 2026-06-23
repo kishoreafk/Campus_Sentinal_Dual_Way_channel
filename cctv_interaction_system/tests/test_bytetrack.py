@@ -59,6 +59,26 @@ def test_bytetrack_initialises_new_track():
     assert tracks1[0].state == "NEW"
 
 
+def test_bytetrack_reactivated_track_removed_from_lost():
+    """A track recovered from the lost pool must not linger there (no dupes)."""
+    tracker = ByteTrack(track_buffer=30)
+    # Frame 1: establish a track.
+    tracker.update([_make_det(200, 400)])
+    # Frame 2: detection disappears -> track goes lost.
+    tracker.update([])
+    assert len(tracker.lost_tracks) == 1
+    lost_obj = tracker.lost_tracks[0]
+    # Frame 3: detection reappears at the same place -> reactivated from lost.
+    tracks3 = tracker.update([_make_det(200, 400)])
+    active_ids = [t.track_id for t in tracks3]
+    # Track is active again and no longer sitting in the lost pool.
+    assert lost_obj.track_id in active_ids
+    assert lost_obj not in tracker.lost_tracks
+    assert len(tracker.lost_tracks) == 0
+    # tracked_tracks must not contain duplicate references to the same object.
+    assert len(tracker.tracked_tracks) == len(set(id(t) for t in tracker.tracked_tracks))
+
+
 def test_bytetrack_low_confidence_filtered():
     tracker = ByteTrack(track_thresh=0.5, track_high_thresh=0.6)
     # Low-confidence detection should not start a new track

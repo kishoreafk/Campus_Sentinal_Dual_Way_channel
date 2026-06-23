@@ -196,6 +196,7 @@ class ByteTrack:
             self.lost_tracks.append(t)
 
         # Re-activate from lost using remaining high-confidence detections
+        reactivated_lost: set[int] = set()
         if self.lost_tracks and len(un_high) > 0:
             lost_boxes = np.array([t.bbox for t in self.lost_tracks], dtype=np.float32)
             # _match returns (matches, unmatched_dets, unmatched_tracks)
@@ -213,6 +214,7 @@ class ByteTrack:
                 t.is_activated = True
                 t.state = "TRACKED"
                 t.tracklet_len += 1
+                reactivated_lost.add(r)
                 new_tracked.append(t)
             # Newly high dets — un_high2 are indices into det_boxes[high_idx][un_high]
             new_high_idx = [un_high[i] for i in un_high2]
@@ -225,10 +227,11 @@ class ByteTrack:
             t = self._det_to_track(self._allocate_id(), det, self.frame_id, is_new=True)
             new_tracked.append(t)
 
-        # Prune lost tracks older than track_buffer
+        # Drop re-activated tracks from the lost pool and prune stale ones.
         self.lost_tracks = [
-            t for t in self.lost_tracks
-            if self.frame_id - t.frame_id <= self.track_buffer
+            t for i, t in enumerate(self.lost_tracks)
+            if i not in reactivated_lost
+            and self.frame_id - t.frame_id <= self.track_buffer
         ]
 
         self.tracked_tracks = new_tracked
