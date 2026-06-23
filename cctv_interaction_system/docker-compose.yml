@@ -1,0 +1,175 @@
+version: "3.9"
+
+# ===================================================================
+# CCTV Interaction Recognition System — Docker Compose
+# ===================================================================
+# Production-style multi-service deployment. Each layer runs as its
+# own service. GPU access via `deploy.resources.reservations.devices`.
+#
+# Quick start (CPU-only mock mode):
+#   docker compose --profile mock up --build
+#
+# Quick start (GPU production):
+#   docker compose --profile gpu up --build
+# ===================================================================
+
+x-base: &base
+  build:
+    context: .
+    dockerfile: deploy/docker/base.Dockerfile
+  env_file:
+    - .env
+  restart: unless-stopped
+  networks:
+    - cctv-net
+
+services:
+  # ----- Infrastructure -----
+  redis:
+    image: redis:7.2-alpine
+    command: redis-server --maxmemory 8gb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks: [cctv-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cctv
+      POSTGRES_PASSWORD: cctv
+      POSTGRES_DB: cctv_alerts
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [cctv-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cctv -d cctv_alerts"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----- Monitoring -----
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [cctv-net]
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana:/etc/grafana/provisioning/dashboards:ro
+    networks: [cctv-net]
+    depends_on: [prometheus]
+
+  # ----- Application -----
+  api:
+    <<: *base
+    build:
+      context: .
+      dockerfile: deploy/docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      python -m scripts.run_pipeline
+      --mock --cameras config/cameras.yaml --api --api-port 8000
+    profiles: ["mock", "gpu"]
+
+  ingestion:
+    <<: *base
+    build:
+      context: .
+      dockerfile: deploy/docker/base.Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      python -m scripts.run_pipeline --mock --cameras config/cameras.yaml
+    profiles: ["mock"]
+
+  # GPU services (only run when --profile gpu is specified)
+  detection:
+    <<: *base
+    build:
+      context: .
+      dockerfile: deploy/docker/base.Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+    profiles: ["gpu"]
+
+  tracking:
+    <<: *base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+    profiles: ["gpu"]
+
+  interaction:
+    <<: *base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=2
+    profiles: ["gpu"]
+
+  individual:
+    <<: *base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=3
+    profiles: ["gpu"]
+
+volumes:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  cctv-net:
+    driver: bridge
