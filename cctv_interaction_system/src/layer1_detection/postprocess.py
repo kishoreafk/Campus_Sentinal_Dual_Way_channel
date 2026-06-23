@@ -78,11 +78,17 @@ def parse_yolov8_pose_output(
             results.append([])
             continue
 
-        # Boxes (cx, cy, w, h) -> xyxy (scaled back to original)
+        # Boxes (cx, cy, w, h) -> xyxy in letterboxed (input_size) space.
         boxes = xywh2xyxy(pred[:, :4])
-        # Scale boxes from input_size space to original image space
-        scale = max(H, W) / input_size
-        boxes = boxes * scale
+        # Invert the letterbox transform: the original frame was resized by
+        # `ratio` (long side -> input_size) and centre-padded on the short
+        # side. Undo the padding offset before rescaling, otherwise coords on
+        # non-square frames are shifted by the pad amount.
+        ratio = input_size / max(H, W)
+        pad_x = (input_size - W * ratio) / 2.0
+        pad_y = (input_size - H * ratio) / 2.0
+        boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / ratio
+        boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / ratio
 
         # NMS
         keep = nms(boxes, pred[:, 4], iou_threshold)
@@ -93,8 +99,8 @@ def parse_yolov8_pose_output(
         for box, row in zip(kept_boxes, kept):
             kp_flat = row[5:]  # 51 = 17 * 3
             kps = kp_flat.reshape(17, 3).copy()
-            kps[:, 0] *= scale  # x
-            kps[:, 1] *= scale  # y
+            kps[:, 0] = (kps[:, 0] - pad_x) / ratio  # x
+            kps[:, 1] = (kps[:, 1] - pad_y) / ratio  # y
             kp_scores = kps[:, 2].tolist()
             kp_list = kps.tolist()
             dets.append({
