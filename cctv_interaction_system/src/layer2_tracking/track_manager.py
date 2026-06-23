@@ -86,11 +86,11 @@ class TrackManager:
         active_tracks: List[Track] = self.tracker.update(detections)
 
         active: List[Tracklet] = []
+        active_ids: set[int] = set()
         for t in active_tracks:
-            tid = t.track_id
-            # Resolve aliases (if this ID was recovered to another)
-            while tid in self.id_aliases:
-                tid = self.id_aliases[tid]
+            # Resolve aliases (a recovered raw ID maps back to its original)
+            tid = self._resolve(t.track_id)
+            active_ids.add(tid)
 
             # Update or create tracklet
             if tid not in self.tracklets:
@@ -138,8 +138,8 @@ class TrackManager:
 
             active.append(tracklet)
 
-        # Mark missing tracklets
-        active_ids = {t.track_id for t in active_tracks}
+        # Mark missing tracklets (active_ids are already alias-resolved)
+        recoveries: List[tuple[int, int]] = []
         for tid, trk in self.tracklets.items():
             if tid not in active_ids:
                 trk.consecutive_missed += 1
@@ -151,9 +151,13 @@ class TrackManager:
                 # Try Re-ID recovery against currently active tracks
                 if trk.state == "OCCLUDED" and tid in self.appearances:
                     recovered = self._try_reid_recovery(tid)
-                    if recovered is not None:
-                        self.id_aliases[tid] = recovered
-                        REID_MATCHES.labels(self.camera_id).inc()
+                    if recovered is not None and recovered != tid:
+                        recoveries.append((tid, recovered))
+
+        # Apply recoveries after iteration (mutates tracklets/aliases).
+        for occluded_id, new_id in recoveries:
+            if self._merge_recovered(occluded_id, new_id):
+                REID_MATCHES.labels(self.camera_id).inc()
 
         ACTIVE_TRACKLETS.labels(self.camera_id).set(len(active))
         TRACKING_LATENCY.observe(time.time() - t0)
@@ -180,6 +184,61 @@ class TrackManager:
                         f"(sim={best_sim:.3f})")
             return best_id
         return None
+
+    def _resolve(self, track_id: int) -> int:
+        """Follow the alias chain to the original (root) track ID."""
+        seen: set[int] = set()
+        tid = track_id
+        while tid in self.id_aliases and tid not in seen:
+            seen.add(tid)
+            tid = self.id_aliases[tid]
+        return tid
+
+    def _merge_recovered(self, occluded_id: int, new_id: int) -> bool:
+        """Fold a reappeared track (``new_id``) back into the occluded
+        original (``occluded_id``), preserving the original ID and history.
+
+        Returns True if the merge was applied.
+        """
+        # ``new_id`` may already have been merged in this frame (e.g. two
+        # occluded tracks matched the same reappearance), or be stale.
+        if new_id not in self.tracklets or new_id == occluded_id:
+            return False
+        if occluded_id not in self.tracklets:
+            return False
+
+        # Route future frames of new_id to the original.
+        self.id_aliases[new_id] = occluded_id
+
+        new_trk = self.tracklets[new_id]
+        orig = self.tracklets[occluded_id]
+        # Carry forward the current observation onto the original tracklet.
+        orig.bbox = new_trk.bbox
+        orig.confidence = new_trk.confidence
+        orig.keypoints = new_trk.keypoints
+        orig.keypoint_scores = new_trk.keypoint_scores
+        orig.last_seen = new_trk.last_seen
+        orig.consecutive_seen = new_trk.consecutive_seen
+        orig.consecutive_missed = 0
+        orig.state = new_trk.state
+
+        # Append the recovered track's recent skeleton frames to the original
+        # buffer so motion continuity is preserved through the occlusion.
+        new_buf = self.skeleton_buffers.get(new_id)
+        orig_buf = self.skeleton_buffers.get(occluded_id)
+        if new_buf is not None and orig_buf is not None:
+            for frame in new_buf.to_array():
+                orig_buf.push(frame)
+        # Refresh the original's appearance with the most recent feature.
+        if new_id in self.appearances:
+            self.appearances[occluded_id] = self.appearances[new_id]
+
+        # Drop the orphaned state belonging to the reappeared ID.
+        self.tracklets.pop(new_id, None)
+        self.skeleton_buffers.pop(new_id, None)
+        self.pose_interpolators.pop(new_id, None)
+        self.appearances.pop(new_id, None)
+        return True
 
     def get_skeleton(self, track_id: int) -> Optional[np.ndarray]:
         """Return padded skeleton (48, 17, 3) for a track."""

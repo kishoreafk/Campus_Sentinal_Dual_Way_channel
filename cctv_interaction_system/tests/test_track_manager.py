@@ -5,7 +5,15 @@ from __future__ import annotations
 import numpy as np
 
 from src.common.schemas import Detection
+from src.layer2_tracking.osnet_reid import BaseReID
 from src.layer2_tracking.track_manager import TrackManager
+
+
+class _ConstReID(BaseReID):
+    """Stub Re-ID: every crop yields the same feature (cosine sim == 1)."""
+
+    def extract(self, frame, bbox):
+        return np.ones(8, dtype=np.float32)
 
 
 def _make_det(cx, cy, w=80, h=160, conf=0.9, kp_offset=0):
@@ -82,6 +90,30 @@ def test_track_manager_handles_empty_detections():
     tm = TrackManager(camera_id="cam_001")
     tracks = tm.update([])
     assert tracks == []
+
+
+def test_track_manager_reid_recovery_restores_original_id():
+    """When an occluded track reappears under a new ByteTrack ID, Re-ID should
+    fold the new ID back into the original (not leave it as dead-code alias)."""
+    tm = TrackManager(camera_id="cam_001", reid=_ConstReID(), reid_cosine_threshold=0.5)
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+    # Establish person A at the left -> track id 1.
+    for _ in range(4):
+        tm.update([_make_det(200, 400)], frame=frame)
+    assert 1 in tm.tracklets
+
+    # A vanishes; a person reappears far away (right) -> a fresh id 2 that,
+    # by appearance, matches the now-occluded id 1. After enough missed
+    # frames, Re-ID recovery should merge id 2 back into id 1.
+    last = []
+    for _ in range(8):
+        last = tm.update([_make_det(800, 400)], frame=frame)
+
+    assert tm.id_aliases.get(2) == 1, "new id should alias back to the original"
+    assert 2 not in tm.tracklets, "orphan recovered tracklet must be cleaned up"
+    assert {t.track_id for t in last} == {1}, "track reported under original id"
+    assert tm.tracklets[1].state == "ACTIVE"
 
 
 def test_track_manager_with_frame():
