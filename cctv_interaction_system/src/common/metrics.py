@@ -158,18 +158,48 @@ ALERT_LATENCY = Histogram(
 )
 
 # ---------------------------------------------------------------------
-# System
+# Production monitoring
 # ---------------------------------------------------------------------
-GPU_UTILIZATION = Gauge(
-    "cctv_gpu_utilization_percent",
-    "GPU utilization",
-    ["gpu_id"],
+QUEUE_FILL_RATIO = Gauge(
+    "cctv_queue_fill_ratio",
+    "Fill ratio of internal queues (0-1)",
+    ["queue", "camera_id"],
     registry=REGISTRY,
 )
-GPU_MEMORY = Gauge(
-    "cctv_gpu_memory_used_bytes",
-    "GPU memory used",
-    ["gpu_id"],
+FFMPEG_CRASHES = Counter(
+    "cctv_ffmpeg_crashes_total",
+    "FFmpeg subprocess crashes",
+    ["camera_id"],
+    registry=REGISTRY,
+)
+GPU_MEMORY_USAGE = Gauge(
+    "cctv_gpu_memory_bytes",
+    "GPU memory usage in bytes",
+    ["device_id"],
+    registry=REGISTRY,
+)
+TENSORRT_INFERENCE_TIME = Histogram(
+    "cctv_tensorrt_inference_seconds",
+    "TensorRT inference time per layer",
+    ["layer"],
+    registry=REGISTRY,
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5),
+)
+CLIP_WRITE_LATENCY = Histogram(
+    "cctv_clip_write_seconds",
+    "Clip write latency",
+    registry=REGISTRY,
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+)
+SLOWFAST_SKIPPED = Counter(
+    "cctv_slowfast_skipped_total",
+    "SlowFast inference skipped (unavailable or stale)",
+    registry=REGISTRY,
+)
+DB_POOL_USAGE = Gauge(
+    "cctv_db_pool_usage",
+    "Database connection pool usage",
+    ["pool_name"],
     registry=REGISTRY,
 )
 

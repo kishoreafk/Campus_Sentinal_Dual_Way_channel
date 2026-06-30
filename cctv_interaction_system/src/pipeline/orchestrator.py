@@ -11,6 +11,12 @@ Each per-camera worker:
   7. Generates alerts via AlertManager (Layer 6)
 
 The FastAPI server (Layer 7) runs in a separate thread.
+
+Production scaling features:
+  - Configurable queue sizes via settings
+  - Multi-threaded tracking loop (one thread per camera or shared pool)
+  - TTL-based eviction for stale pending detections
+  - Redis pub/sub for alert broadcasting
 """
 
 from __future__ import annotations
@@ -26,8 +32,10 @@ import numpy as np
 
 from config.settings import Settings, get_settings
 from src.common.logger import get_logger
+from src.common.metrics import QUEUE_FILL_RATIO
 from src.common.schemas import (
     ActionEvent,
+    Alert,
     Detection,
     FrameDetections,
     IndividualPrediction,
@@ -105,10 +113,13 @@ class Pipeline:
         self._lock = threading.RLock()
         self._camera_pipelines: Dict[str, CameraPipeline] = {}
         self._ingestion_workers: Dict[str, IngestionWorker] = {}
-        self._detection_queue: "queue.Queue" = queue.Queue(maxsize=512)
-        self._tracking_queue: "queue.Queue" = queue.Queue(maxsize=2048)
+        s = self.settings
+        self._detection_queue: "queue.Queue" = queue.Queue(maxsize=s.detection_queue_size)
+        self._tracking_queue: "queue.Queue" = queue.Queue(maxsize=s.tracking_queue_size)
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
+        self._pending_ttl = s.pending_ttl_s
+        self._tracking_threads = s.tracking_threads
         # Register cameras eagerly so start() has work to do.
         for cam in self.cameras:
             self.add_camera(cam)
@@ -148,6 +159,7 @@ class Pipeline:
                 fps=self.settings.layer0.target_fps,
                 use_mock=self.use_mock_ingestion,
                 use_hwaccel=not self.settings.mock_mode,
+                backpressure_sleep=self.settings.layer0.backpressure_sleep_s,
             )
             self._ingestion_workers[cid] = worker
             worker.start()
@@ -155,12 +167,15 @@ class Pipeline:
         self._threads.append(threading.Thread(
             target=self._detection_loop, name="detection-loop", daemon=True,
         ))
-        self._threads.append(threading.Thread(
-            target=self._tracking_loop, name="tracking-loop", daemon=True,
-        ))
+        n_track = max(1, self._tracking_threads)
+        for i in range(n_track):
+            self._threads.append(threading.Thread(
+                target=self._tracking_loop, name=f"tracking-loop-{i}", daemon=True,
+            ))
         for t in self._threads:
             t.start()
-        logger.info(f"Pipeline started with {len(self.cameras)} cameras")
+        logger.info(f"Pipeline started with {len(self.cameras)} cameras "
+                     f"({n_track} tracking threads)")
 
     def stop(self) -> None:
         self._stop.set()
@@ -213,19 +228,22 @@ class Pipeline:
     # drives the per-camera pipeline.
     # ------------------------------------------------------------------
     def _tracking_loop(self) -> None:
-        # Per-camera queue of pending detections (so we don't run track update
-        # for a camera without a fresh detection).
+        # Per-camera queue of pending detections
         pending: Dict[str, list[FrameDetections]] = defaultdict(list)
+        # TTL for pending detections per camera (to evict stale entries)
+        pending_ts: Dict[str, float] = {}
+
         while not self._stop.is_set():
             try:
-                pkt = self._tracking_queue.get(timeout=0.1)
+                pkt = self._tracking_queue.get(timeout=0.05)
             except queue.Empty:
+                self._evict_stale_pending(pending, pending_ts)
                 continue
 
             if pkt.get("type") == "detection_result":
                 fd: FrameDetections = pkt["data"]
                 pending[fd.camera_id].append(fd)
-                # Process at most the latest 3 backlog entries per camera
+                pending_ts[fd.camera_id] = time.time()
                 if len(pending[fd.camera_id]) > 3:
                     pending[fd.camera_id] = pending[fd.camera_id][-3:]
                 continue
@@ -246,12 +264,9 @@ class Pipeline:
             # If we have a pending detection for this camera, use the latest one
             if pending[camera_id]:
                 fd = pending[camera_id].pop(0)
-                # Convert FrameDetections to list[Detection]
                 dets: List[Detection] = list(fd.detections)
                 tracklets = pipeline.track_manager.update(dets, frame=frame)
             else:
-                # No fresh detection — just predict poses via Kalman
-                # (we still need tracklets to be returned)
                 tracklets = [t for t in pipeline.track_manager.tracklets.values()
                              if t.state in ("NEW", "CONFIRMED", "ACTIVE")]
 
@@ -280,81 +295,124 @@ class Pipeline:
                 )
 
             # Layer 5: Post-process
-            self._post_process(pipeline, interaction_preds, individual_preds)
+            alerts = _post_process(pipeline, interaction_preds, individual_preds, self.alert_manager)
+            for alert in alerts:
+                _broadcast_alert(alert)
 
-    # ------------------------------------------------------------------
-    # Post-processing — EMA + state machine + alert
-    # ------------------------------------------------------------------
-    def _post_process(
-        self,
-        pipeline: CameraPipeline,
-        interactions: List[InteractionPrediction],
-        individuals: List[IndividualPrediction],
-    ) -> None:
-        for ip in interactions:
-            if ip.label == "none":
-                continue
-            track_key = f"pair_{ip.track_id_a}_{ip.track_id_b}"
-            # Update EMA on top-1 score for this label
-            smoothed = pipeline.ema.update(
-                ip.camera_id, track_key, ip.label, ip.confidence,
-            )
-            state = pipeline.state_machine.update(
-                ip.camera_id, track_key, ip.label, smoothed,
-            )
-            if state == State.ALERT:
-                track_ids = (ip.track_id_a, ip.track_id_b)
-                if pipeline.alert_dedup.should_alert(
-                    ip.camera_id, track_ids, ip.label, now=ip.timestamp,
-                ):
-                    event = ActionEvent(
-                        camera_id=ip.camera_id,
-                        frame_id=ip.frame_id,
-                        timestamp=ip.timestamp,
-                        action_type=ip.label,
-                        confidence=smoothed,
-                        track_ids=list(track_ids),
-                        bbox_coords=[],  # could be filled from tracklets
-                        is_interaction=True,
-                        state="alert",
-                    )
-                    alert = self.alert_manager.handle_event(event)
-                    if alert:
-                        self._broadcast_alert(alert)
+            # Report queue fill ratios
+            self._report_queue_metrics()
 
-        for ind in individuals:
-            if ind.label == "none":
-                continue
-            track_key = f"tid_{ind.track_id}"
-            smoothed = pipeline.ema.update(
-                ind.camera_id, track_key, ind.label, ind.confidence,
-            )
-            state = pipeline.state_machine.update(
-                ind.camera_id, track_key, ind.label, smoothed,
-            )
-            if state == State.ALERT:
-                if pipeline.alert_dedup.should_alert(
-                    ind.camera_id, (ind.track_id,), ind.label, now=ind.timestamp,
-                ):
-                    event = ActionEvent(
-                        camera_id=ind.camera_id,
-                        frame_id=ind.frame_id,
-                        timestamp=ind.timestamp,
-                        action_type=ind.label,
-                        confidence=smoothed,
-                        track_ids=[ind.track_id],
-                        bbox_coords=[],
-                        is_interaction=False,
-                        state="alert",
-                    )
-                    alert = self.alert_manager.handle_event(event)
-                    if alert:
-                        self._broadcast_alert(alert)
+    def _evict_stale_pending(self, pending: dict, timestamps: dict) -> None:
+        """Remove pending detections older than TTL."""
+        now = time.time()
+        stale = [cid for cid, ts in timestamps.items() if now - ts > self._pending_ttl]
+        for cid in stale:
+            pending.pop(cid, None)
+            timestamps.pop(cid, None)
 
-    def _broadcast_alert(self, alert) -> None:
-        """Hook for pushing alerts to WS clients / Redis pub-sub."""
-        # In production this would publish to Redis / WS broadcast
-        logger.info(f"Broadcast alert: {alert.alert_id} {alert.action_type}")
+    def _report_queue_metrics(self) -> None:
+        for name, q in [("detection", self._detection_queue), ("tracking", self._tracking_queue)]:
+            try:
+                size = q.qsize()
+                maxsize = q.maxsize
+                if maxsize > 0:
+                    QUEUE_FILL_RATIO.labels(name, "all").set(size / maxsize)
+            except Exception:
+                pass
+
+# ------------------------------------------------------------------
+# Shared post-processing — EMA + state machine + dedup
+# ------------------------------------------------------------------
+def _process_prediction(
+    pipeline: CameraPipeline,
+    pred,
+    track_key: str,
+    track_ids: tuple,
+    is_interaction: bool,
+) -> Optional[ActionEvent]:
+    if pred.label == "none":
+        return None
+    smoothed = pipeline.ema.update(pred.camera_id, track_key, pred.label, pred.confidence)
+    state = pipeline.state_machine.update(pred.camera_id, track_key, pred.label, smoothed)
+    if state != State.ALERT:
+        return None
+    if not pipeline.alert_dedup.should_alert(pred.camera_id, track_ids, pred.label, now=pred.timestamp):
+        return None
+    return ActionEvent(
+        camera_id=pred.camera_id,
+        frame_id=pred.frame_id,
+        timestamp=pred.timestamp,
+        action_type=pred.label,
+        confidence=smoothed,
+        track_ids=list(track_ids),
+        bbox_coords=[],
+        is_interaction=is_interaction,
+        state="alert",
+    )
+
+
+def _post_process(
+    pipeline: CameraPipeline,
+    interactions: List[InteractionPrediction],
+    individuals: List[IndividualPrediction],
+    alert_manager: AlertManager,
+) -> List[Alert]:
+    alerts: List[Alert] = []
+    for ip in interactions:
+        event = _process_prediction(
+            pipeline, ip, f"pair_{ip.track_id_a}_{ip.track_id_b}",
+            (ip.track_id_a, ip.track_id_b), True,
+        )
+        if event:
+            alert = alert_manager.handle_event(event)
+            if alert:
+                alerts.append(alert)
+    for ind in individuals:
+        event = _process_prediction(
+            pipeline, ind, f"tid_{ind.track_id}",
+            (ind.track_id,), False,
+        )
+        if event:
+            alert = alert_manager.handle_event(event)
+            if alert:
+                alerts.append(alert)
+    return alerts
+
+
+# Redis client for alert broadcasting (lazy init)
+_redis_client = None
+
+
+def _get_redis():
+    global _redis_client
+    if _redis_client is None:
+        try:
+            from src.common.redis_client import RedisClient
+            _redis_client = RedisClient()
+            if _redis_client.ping():
+                logger.info("Redis client connected for alert broadcasting")
+            else:
+                _redis_client = None
+        except Exception as e:
+            logger.warning(f"Redis not available ({e}); alerts logged only")
+    return _redis_client
+
+
+def _broadcast_alert(alert) -> None:
+    """Push alert to Redis pub/sub and log."""
+    logger.info(f"Broadcast alert: {alert.alert_id} {alert.action_type}")
+    r = _get_redis()
+    if r is not None:
+        try:
+            r.publish("alerts", {
+                "alert_id": alert.alert_id,
+                "camera_id": alert.camera_id,
+                "action_type": alert.action_type,
+                "confidence": alert.confidence,
+                "timestamp": alert.timestamp,
+            })
+        except Exception as e:
+            logger.debug(f"Redis publish failed: {e}")
 
 
 # ---------------------------------------------------------------------
@@ -435,56 +493,7 @@ class SyncPipeline:
         ) if single_tracklets else []
 
         # Post-process
-        new_alerts = []
-        for ip in interactions:
-            if ip.label == "none":
-                continue
-            track_key = f"pair_{ip.track_id_a}_{ip.track_id_b}"
-            smoothed = pipeline.ema.update(ip.camera_id, track_key, ip.label, ip.confidence)
-            state = pipeline.state_machine.update(ip.camera_id, track_key, ip.label, smoothed)
-            if state == State.ALERT:
-                if pipeline.alert_dedup.should_alert(
-                    ip.camera_id, (ip.track_id_a, ip.track_id_b), ip.label, now=ip.timestamp,
-                ):
-                    event = ActionEvent(
-                        camera_id=ip.camera_id,
-                        frame_id=ip.frame_id,
-                        timestamp=ip.timestamp,
-                        action_type=ip.label,
-                        confidence=smoothed,
-                        track_ids=[ip.track_id_a, ip.track_id_b],
-                        bbox_coords=[],
-                        is_interaction=True,
-                        state="alert",
-                    )
-                    alert = self.alert_manager.handle_event(event)
-                    if alert:
-                        new_alerts.append(alert)
-
-        for ind in individuals:
-            if ind.label == "none":
-                continue
-            track_key = f"tid_{ind.track_id}"
-            smoothed = pipeline.ema.update(ind.camera_id, track_key, ind.label, ind.confidence)
-            state = pipeline.state_machine.update(ind.camera_id, track_key, ind.label, smoothed)
-            if state == State.ALERT:
-                if pipeline.alert_dedup.should_alert(
-                    ind.camera_id, (ind.track_id,), ind.label, now=ind.timestamp,
-                ):
-                    event = ActionEvent(
-                        camera_id=ind.camera_id,
-                        frame_id=ind.frame_id,
-                        timestamp=ind.timestamp,
-                        action_type=ind.label,
-                        confidence=smoothed,
-                        track_ids=[ind.track_id],
-                        bbox_coords=[],
-                        is_interaction=False,
-                        state="alert",
-                    )
-                    alert = self.alert_manager.handle_event(event)
-                    if alert:
-                        new_alerts.append(alert)
+        new_alerts = _post_process(pipeline, interactions, individuals, self.alert_manager)
 
         return {
             "tracklets": tracklets,

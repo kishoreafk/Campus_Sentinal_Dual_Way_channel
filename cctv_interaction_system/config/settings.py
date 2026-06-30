@@ -57,6 +57,25 @@ class Layer0Config(BaseModel):
     ffmpeg_bufsize: int = 10 ** 8
     reconnect_delay_s: float = 2.0
     max_reconnect_attempts: int = 5
+    n_decoder_sessions: int = 4
+    backpressure_sleep_s: float = 0.01
+
+
+class GPUDeviceConfig(BaseModel):
+    device_id: int = 0
+    max_workspace_gb: int = 4
+    half_precision: bool = True
+
+
+class ModelRegistry(BaseModel):
+    """Versioned model paths per environment."""
+    yolov8_pose_engine: str = "models/yolov8n-pose.engine"
+    yolov8_pose_onnx: str = "models/yolov8n-pose.onnx"
+    yolov8_pose_pt: str = "models/yolov8n-pose.pt"
+    poseconv3d_pair_engine: str = "models/poseconv3d_pair.engine"
+    poseconv3d_individual_engine: str = "models/poseconv3d_individual.engine"
+    slowfast_engine: str = "models/slowfast.engine"
+    osnet_weights: str = "osnet_x0_25"
 
 
 class Layer1Config(BaseModel):
@@ -67,10 +86,12 @@ class Layer1Config(BaseModel):
     imgsz: int = 640
     max_batch: int = 32
     batch_timeout_ms: int = 50
+    min_batch_threshold: int = 1
     half_precision: bool = True
     conf_threshold: float = 0.35
     iou_threshold: float = 0.65
     device_id: int = 0
+    warmup_iters: int = 10
     # If true, fall back to a CPU mock (used in tests / CI without GPU)
     use_mock: bool = True
 
@@ -92,6 +113,7 @@ class Layer2Config(BaseModel):
     kalman_process_noise: float = 0.01
     # Skeleton buffer (per person)
     skeleton_buffer_len: int = 48
+    appearance_max_age_frames: int = 300
     use_mock: bool = True
 
 
@@ -171,9 +193,11 @@ class Layer6Config(BaseModel):
     clip_after_s: int = 5
     clip_bitrate: int = 2_000_000  # 2 Mbps
     clip_codec: str = "libx264"
+    clip_codec_gpu: str = "h264_nvenc"
     clip_storage_path: str = "data/clips"
     hot_retention_days: int = 30
     cold_retention_days: int = 365
+    clip_write_workers: int = 2  # async clip writer thread pool size
 
 
 class Layer7Config(BaseModel):
@@ -216,6 +240,11 @@ class Settings(BaseSettings):
 
     # Camera config file (YAML)
     cameras_file: str = "config/cameras.yaml"
+    # Queue sizes
+    detection_queue_size: int = 512
+    tracking_queue_size: int = 2048
+    tracking_threads: int = 1
+    pending_ttl_s: float = 30.0
 
 
 @lru_cache(maxsize=1)

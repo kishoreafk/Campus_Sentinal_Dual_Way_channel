@@ -1,0 +1,17 @@
+# Node (opencode tool runs from repo root)
+node_modules/
+package*.json
+
+# OpenCode config
+opencode.json
+.commandcode/
+
+# User config
+AGENTS.md
+*.md~
+
+# System
+*.deb
+cuda-keyring*.deb
+Thumbs.db
+.DS_Store

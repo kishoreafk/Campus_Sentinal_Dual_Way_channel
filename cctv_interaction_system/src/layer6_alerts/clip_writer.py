@@ -1,10 +1,9 @@
 """Event clip writer — extracts a 10-second MP4 clip around an alert.
 
 5 seconds before + 5 seconds after the alert timestamp. Uses FFmpeg
-subprocess to write H.264 MP4 at 2 Mbps.
+subprocess to write H.264 MP4 at 2 Mbps with optional GPU encoding.
 
-In mock mode (no real RTSP frames), the clip writer generates a synthetic
-clip with overlaid alert metadata so the pipeline is testable end-to-end.
+Clip writing is offloaded to a thread pool to avoid blocking the pipeline.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Deque, Optional, Tuple
 
@@ -21,6 +21,7 @@ import numpy as np
 
 from config.settings import get_settings
 from src.common.logger import get_logger
+from src.common.metrics import CLIP_WRITE_LATENCY
 
 logger = get_logger()
 
@@ -52,7 +53,10 @@ class FrameRingBuffer:
 
 
 class ClipWriter:
-    """Writes event clips to disk as MP4 (H.264)."""
+    """Writes event clips to disk as MP4 (H.264), optionally using GPU encoding.
+
+    Writing is submitted to a thread pool so the caller is never blocked.
+    """
 
     def __init__(
         self,
@@ -61,16 +65,20 @@ class ClipWriter:
         clip_after_s: int = 5,
         bitrate: int = 2_000_000,
         codec: str = "libx264",
+        codec_gpu: str = "h264_nvenc",
         fps: int = 30,
+        use_gpu: bool = False,
+        num_workers: int = 2,
     ):
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.clip_before_s = clip_before_s
         self.clip_after_s = clip_after_s
         self.bitrate = bitrate
-        self.codec = codec
+        self.codec = codec_gpu if (use_gpu and _nvenc_available()) else codec
         self.fps = fps
         self.frame_buffers: dict[str, FrameRingBuffer] = {}
+        self._executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="clip")
 
     def get_buffer(self, camera_id: str) -> FrameRingBuffer:
         if camera_id not in self.frame_buffers:
@@ -83,46 +91,44 @@ class ClipWriter:
     def push_frame(self, camera_id: str, timestamp: float, frame: np.ndarray) -> None:
         self.get_buffer(camera_id).push(timestamp, frame)
 
-    def write_clip(
+    def write_clip_async(
         self,
         camera_id: str,
         alert_timestamp: float,
         alert_id: str,
         action_label: str,
-        frames_before: Optional[list[np.ndarray]] = None,
-        frames_after: Optional[list[np.ndarray]] = None,
+    ) -> None:
+        """Submit clip write to thread pool (non-blocking)."""
+        self._executor.submit(self._write_clip_sync, camera_id, alert_timestamp, alert_id, action_label)
+
+    def _write_clip_sync(
+        self,
+        camera_id: str,
+        alert_timestamp: float,
+        alert_id: str,
+        action_label: str,
     ) -> Optional[str]:
-        """Write a clip to disk and return the path.
+        """Synchronous clip write — runs in thread pool."""
+        import time as _time
+        t0 = _time.time()
 
-        In production with real RTSP frames, the clip writer would wait
-        clip_after_s seconds for the "after" frames to arrive, then assemble
-        the full clip.
-
-        For testing, we accept pre-supplied frames_before / frames_after.
-        """
         try:
             import cv2
         except ImportError:
             logger.warning("cv2 not available — cannot write clip")
             return None
 
-        # Get frames from ring buffer
         buf = self.get_buffer(camera_id)
-        if frames_before is None:
-            frames_before = buf.get_last_n_seconds(self.clip_before_s, alert_timestamp)
-
-        # If we don't have after-frames, just use what we have
-        if frames_after is None:
-            frames_after = []
+        frames_before = buf.get_last_n_seconds(self.clip_before_s, alert_timestamp)
+        frames_after = buf.get_range(alert_timestamp, alert_timestamp + self.clip_after_s)
 
         all_frames = list(frames_before) + list(frames_after)
         if not all_frames:
             logger.warning(f"[{camera_id}] no frames for clip {alert_id}")
             return None
 
-        # Determine frame size from first frame
         H, W = all_frames[0].shape[:2]
-        date_str = time.strftime("%Y%m%d_%H%M%S", time.localtime(alert_timestamp))
+        date_str = _time.strftime("%Y%m%d_%H%M%S", _time.localtime(alert_timestamp))
         filename = f"{camera_id}_{action_label}_{date_str}_{alert_id[:8]}.mp4"
         filepath = self.storage_path / filename
 
@@ -134,7 +140,6 @@ class ClipWriter:
 
         try:
             for frame in all_frames:
-                # Overlay alert text on the frame
                 annotated = frame.copy()
                 try:
                     cv2.putText(
@@ -152,5 +157,24 @@ class ClipWriter:
         finally:
             writer.release()
 
+        CLIP_WRITE_LATENCY.observe(_time.time() - t0)
         logger.info(f"[{camera_id}] wrote clip {filepath} ({len(all_frames)} frames)")
         return str(filepath)
+
+    # Keep backward-compat sync method
+    write_clip = _write_clip_sync
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False)
+
+
+def _nvenc_available() -> bool:
+    """Check if NVENC encoder is available via ffmpeg."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-encoders", "-hide_banner"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "h264_nvenc" in result.stdout
+    except Exception:
+        return False

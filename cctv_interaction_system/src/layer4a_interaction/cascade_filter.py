@@ -22,6 +22,7 @@ from src.common.metrics import (
     CASCADE_FILTER_RATE,
     INTERACTION_PREDICTIONS,
     RECOGNITION_LATENCY,
+    SLOWFAST_SKIPPED,
 )
 from src.common.schemas import (
     InteractionPrediction,
@@ -156,7 +157,9 @@ class CascadeFilter:
                     top_idx = int(np.argmax(fused))
                     INTERACTION_PREDICTIONS.labels(p.camera_id, self.labels[top_idx]).inc()
         elif survivors:
-            # No SlowFast available — fall back to pose-only
+            SLOWFAST_SKIPPED.inc(len(survivors))
+            logger.warning(f"SlowFast unavailable or frame_buffer empty — "
+                           f"{len(survivors)} survivors falling back to pose-only")
             for i in survivors:
                 p = valid_pairs[i]
                 results.append(self._make_prediction(p, pose_probs[i], None, cascade_passed=False))

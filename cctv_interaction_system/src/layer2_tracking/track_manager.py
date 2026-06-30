@@ -24,7 +24,7 @@ from src.common.schemas import Detection, Tracklet
 from .bytetrack import ByteTrack, Track
 from .kalman_pose import PoseInterpolator
 from .osnet_reid import BaseReID, ReID
-from .skeleton_buffer import SkeletonBuffer
+from src.common.schemas import SkeletonBuffer
 
 logger = get_logger()
 
@@ -51,6 +51,7 @@ class TrackManager:
         skeleton_buffer_len: int = 48,
         reid: Optional[BaseReID] = None,
         process_noise: float = 0.01,
+        appearance_max_age_frames: int = 300,
     ):
         self.camera_id = camera_id
         self.tracker = ByteTrack(
@@ -60,6 +61,7 @@ class TrackManager:
         self.reid_cosine_threshold = reid_cosine_threshold
         self.skeleton_buffer_len = skeleton_buffer_len
         self.process_noise = process_noise
+        self.appearance_max_age_frames = appearance_max_age_frames
 
         # track_id -> Tracklet (post-processing view)
         self.tracklets: Dict[int, Tracklet] = {}
@@ -71,6 +73,8 @@ class TrackManager:
         self.appearances: Dict[int, np.ndarray] = {}
         # Track ID aliasing (recovered IDs)
         self.id_aliases: Dict[int, int] = {}
+        # track_id -> last frame seen (for appearance eviction)
+        self._last_seen_frame: Dict[int, int] = {}
 
     def update(self, detections: List[Detection], frame: Optional[np.ndarray] = None) -> List[Tracklet]:
         """Process one frame's detections.
@@ -129,6 +133,7 @@ class TrackManager:
                     self.appearances[tid] = feat
                 except Exception as e:
                     logger.debug(f"ReID extract failed for track {tid}: {e}")
+            self._last_seen_frame[tid] = sum(1 for t in self.tracklets if t != tid)  # approximate frame number
 
             # State machine
             if tracklet.consecutive_seen >= 3:
@@ -159,9 +164,25 @@ class TrackManager:
             if self._merge_recovered(occluded_id, new_id):
                 REID_MATCHES.labels(self.camera_id).inc()
 
+        # Evict stale appearance features for LOST tracks
+        self._evict_stale_appearances()
+
         ACTIVE_TRACKLETS.labels(self.camera_id).set(len(active))
         TRACKING_LATENCY.observe(time.time() - t0)
         return active
+
+    def _evict_stale_appearances(self) -> None:
+        """Remove appearance features for tracks that have been LOST for too long."""
+        evict = []
+        for tid in self.appearances:
+            if tid not in self.tracklets:
+                evict.append(tid)
+            elif self.tracklets[tid].state == "LOST" and \
+                 self.tracklets[tid].consecutive_missed > self.appearance_max_age_frames:
+                evict.append(tid)
+        for tid in evict:
+            self.appearances.pop(tid, None)
+            self._last_seen_frame.pop(tid, None)
 
     def _try_reid_recovery(self, lost_id: int) -> Optional[int]:
         """Look for an active track whose appearance matches the lost one."""
@@ -265,4 +286,5 @@ def make_track_manager(camera_id: str) -> TrackManager:
         reid_cosine_threshold=cfg.reid_cosine_threshold,
         skeleton_buffer_len=cfg.skeleton_buffer_len,
         process_noise=cfg.kalman_process_noise,
+        appearance_max_age_frames=cfg.appearance_max_age_frames,
     )

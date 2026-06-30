@@ -1,4 +1,7 @@
-"""PostgreSQL client for Layer 6 (alerts persistence)."""
+"""PostgreSQL client for Layer 6 (alerts persistence).
+
+Uses a connection pool for production use at scale.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ from typing import Any, Iterator, List, Optional
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 from .logger import get_logger
 
@@ -58,7 +62,7 @@ CREATE TABLE IF NOT EXISTS system_events (
 
 
 class PostgresClient:
-    """Wrapper around psycopg2 with helpers for alert persistence."""
+    """Wrapper around psycopg2 with connection pool for alert persistence."""
 
     def __init__(
         self,
@@ -67,30 +71,37 @@ class PostgresClient:
         user: str = "cctv",
         password: str = "cctv",
         database: str = "cctv_alerts",
+        min_conn: int = 2,
+        max_conn: int = 10,
     ):
         self.conn_params = dict(
             host=host, port=port, user=user, password=password, dbname=database,
         )
-        self._conn = None
+        self._pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=min_conn, maxconn=max_conn, **self.conn_params,
+        )
+        self._conn = None  # kept for backward compat with singleton
 
     def _connect(self):
         if self._conn is None or self._conn.closed:
-            self._conn = psycopg2.connect(**self.conn_params)
-            self._conn.autocommit = False
+            self._conn = self._pool.getconn()
         return self._conn
 
     @contextmanager
     def cursor(self) -> Iterator[psycopg2.extras.RealDictCursor]:
-        conn = self._connect()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        conn = self._pool.getconn()
         try:
-            yield cur
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            try:
+                yield cur
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cur.close()
         finally:
-            cur.close()
+            self._pool.putconn(conn)
 
     def init_schema(self) -> None:
         with self.cursor() as cur:
@@ -123,6 +134,25 @@ class PostgresClient:
                     clip_path, json.dumps(metadata or {}),
                 ),
             )
+
+    def insert_alerts_batch(self, alerts: List[dict]) -> None:
+        """Batch insert multiple alerts in a single transaction."""
+        with self.cursor() as cur:
+            for a in alerts:
+                cur.execute(
+                    """
+                    INSERT INTO alerts
+                      (id, camera_id, timestamp, action_type, confidence,
+                       track_ids, bbox_coords, clip_path, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        a["alert_id"], a["camera_id"], a["timestamp"],
+                        a["action_type"], a["confidence"],
+                        json.dumps(a["track_ids"]), json.dumps(a.get("bbox_coords", [])),
+                        a.get("clip_path"), json.dumps(a.get("metadata", {})),
+                    ),
+                )
 
     def list_alerts(
         self,
@@ -157,8 +187,7 @@ class PostgresClient:
             )
 
     def close(self) -> None:
-        if self._conn and not self._conn.closed:
-            self._conn.close()
+        self._pool.closeall()
 
 
 # Module-level singleton

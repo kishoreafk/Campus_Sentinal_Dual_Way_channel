@@ -12,7 +12,7 @@ from src.layer4a_interaction.roi_extractor import (
     extract_paired_skeletons,
     extract_roi_clip,
 )
-from src.layer4a_interaction.fusion import weighted_fusion
+
 
 
 def test_poseconv3d_mock_pair_returns_probs():
@@ -83,10 +83,11 @@ def test_extract_roi_clip_empty_buffer():
 
 
 def test_weighted_fusion():
-    pose = np.array([0.5, 0.5], dtype=np.float32)
-    rgb = np.array([0.3, 0.7], dtype=np.float32)
-    fused = weighted_fusion(pose, rgb, 0.6, 0.4)
-    expected = 0.6 * pose + 0.4 * rgb
+    pose = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+    rgb = np.array([0.3, 0.7, 0.0], dtype=np.float32)
+    cf = make_cascade_filter()
+    fused = cf._fuse(pose, rgb)
+    expected = cf.fusion_pose_weight * pose + cf.fusion_rgb_weight * rgb
     np.testing.assert_allclose(fused, expected)
 
 

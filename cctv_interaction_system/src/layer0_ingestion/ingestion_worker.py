@@ -6,6 +6,7 @@ Reads frames from an RTSP source (or mock), applies frame decimation
 
 from __future__ import annotations
 
+import hashlib
 import queue
 import threading
 import time
@@ -13,7 +14,12 @@ from typing import Optional
 
 from config.settings import get_settings
 from src.common.logger import get_logger
-from src.common.metrics import FRAMES_DROPPED, FRAMES_INGESTED, INGESTION_LATENCY
+from src.common.metrics import (
+    FRAMES_DROPPED,
+    FRAMES_INGESTED,
+    INGESTION_LATENCY,
+    QUEUE_FILL_RATIO,
+)
 
 from .ffmpeg_pipeline import FFmpegPipeline, MockSource
 
@@ -38,6 +44,7 @@ class IngestionWorker(threading.Thread):
         max_queue_size: int = 256,
         reconnect_delay: float = 2.0,
         max_reconnect: int = 5,
+        backpressure_sleep: float = 0.01,
         name: Optional[str] = None,
     ):
         super().__init__(name=name or f"ingest-{camera_id}", daemon=True)
@@ -54,6 +61,7 @@ class IngestionWorker(threading.Thread):
         self.max_queue_size = max_queue_size
         self.reconnect_delay = reconnect_delay
         self.max_reconnect = max_reconnect
+        self.backpressure_sleep = backpressure_sleep
         self._stop = threading.Event()
         self.frame_counter = 0
 
@@ -62,8 +70,9 @@ class IngestionWorker(threading.Thread):
 
     def _make_source(self):
         if self.use_mock:
+            seed = int(hashlib.md5(self.camera_id.encode()).hexdigest(), 16) & 0xFFFFFFFF if self.camera_id else 0
             return MockSource(self.camera_id, self.width, self.height, self.fps,
-                              seed=hash(self.camera_id) & 0xFFFFFFFF)
+                              seed=seed)
         return FFmpegPipeline(
             self.camera_id, self.rtsp_url, self.width, self.height, self.fps,
             use_hwaccel=self.use_hwaccel, reconnect_delay=self.reconnect_delay,
@@ -75,15 +84,21 @@ class IngestionWorker(threading.Thread):
             q.put_nowait(packet)
             return True
         except queue.Full:
-            # Drop oldest by popping one then putting
+            FRAMES_DROPPED.labels(self.camera_id).inc()
+            # Backpressure: sleep briefly so downstream can drain
+            self._stop.wait(self.backpressure_sleep)
+            # Retry once — if still full, skip this frame
             try:
-                q.get_nowait()
                 q.put_nowait(packet)
-                FRAMES_DROPPED.labels(self.camera_id).inc()
                 return True
-            except Exception:
-                FRAMES_DROPPED.labels(self.camera_id).inc()
+            except queue.Full:
                 return False
+
+    def _frame_timestamp(self, source, frame: np.ndarray) -> float:
+        """Get frame timestamp, preferring PTS over wall clock."""
+        if hasattr(source, 'last_pts') and source.last_pts is not None:
+            return source.last_pts
+        return time.time()
 
     def run(self) -> None:
         reconnect_attempts = 0
@@ -99,7 +114,7 @@ class IngestionWorker(threading.Thread):
                         logger.warning(f"[{self.camera_id}] source returned None — reconnecting")
                         break
                     self.frame_counter += 1
-                    ts = time.time()
+                    ts = self._frame_timestamp(source, frame)
 
                     # Always feed tracking
                     track_pkt = {
@@ -111,7 +126,9 @@ class IngestionWorker(threading.Thread):
                         "height": self.height,
                         "frame_type": "tracking",
                     }
-                    self._enqueue(self.tracking_queue, track_pkt)
+                    if not self._enqueue(self.tracking_queue, track_pkt):
+                        # Queue saturated — skip detection too, drop frame
+                        continue
 
                     # Only feed detection every Nth frame
                     if self.frame_counter % self.detection_stride == 0:
@@ -128,6 +145,16 @@ class IngestionWorker(threading.Thread):
 
                     FRAMES_INGESTED.labels(self.camera_id).inc()
                     INGESTION_LATENCY.observe(time.time() - t0)
+
+                    # Report queue fill ratios for monitoring
+                    dq_size = self.detection_queue.qsize() if hasattr(self.detection_queue, 'qsize') else 0
+                    tq_size = self.tracking_queue.qsize() if hasattr(self.tracking_queue, 'qsize') else 0
+                    dq_max = getattr(self.detection_queue, 'maxsize', 512)
+                    tq_max = getattr(self.tracking_queue, 'maxsize', 2048)
+                    if dq_max > 0:
+                        QUEUE_FILL_RATIO.labels("detection", self.camera_id).set(dq_size / dq_max)
+                    if tq_max > 0:
+                        QUEUE_FILL_RATIO.labels("tracking", self.camera_id).set(tq_size / tq_max)
             except Exception as e:
                 logger.error(f"[{self.camera_id}] ingestion error: {e}")
             finally:
@@ -142,8 +169,10 @@ class IngestionWorker(threading.Thread):
             if reconnect_attempts > self.max_reconnect:
                 logger.error(f"[{self.camera_id}] max reconnect attempts reached — exiting")
                 break
-            logger.info(f"[{self.camera_id}] reconnecting in {self.reconnect_delay}s "
+            # Exponential backoff for reconnects
+            delay = min(self.reconnect_delay * (2 ** (reconnect_attempts - 1)), 60.0)
+            logger.info(f"[{self.camera_id}] reconnecting in {delay:.1f}s "
                         f"(attempt {reconnect_attempts}/{self.max_reconnect})")
-            self._stop.wait(self.reconnect_delay)
+            self._stop.wait(delay)
 
         logger.info(f"[{self.camera_id}] ingestion worker stopped")

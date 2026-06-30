@@ -15,45 +15,74 @@ from typing import List, Optional
 
 
 class BatchCollector:
-    """Thread-safe batch collector with timeout-based flush."""
+    """Thread-safe batch collector with timeout-based flush.
 
-    def __init__(self, max_batch: int = 32, timeout_ms: int = 50):
+    Uses a single lock and a threading.Event for efficient wakeup.
+    """
+
+    def __init__(self, max_batch: int = 32, timeout_ms: int = 50, min_batch: int = 1):
         self.max_batch = max_batch
         self.timeout = timeout_ms / 1000.0
+        self.min_batch = min_batch
         self._buf: List[dict] = []
         self._first_added_at: Optional[float] = None
         self._lock = threading.Lock()
+        self._ready = threading.Event()
 
     def add(self, packet: dict) -> None:
         with self._lock:
-            if not self._buf:
-                self._first_added_at = time.time()
+            is_first = not self._buf
             self._buf.append(packet)
+            if is_first:
+                self._first_added_at = time.time()
+            if len(self._buf) >= self.max_batch:
+                self._ready.set()
 
-    def should_flush(self) -> bool:
+    def get_batch(self) -> Optional[List[dict]]:
+        """Block until a batch is ready, then return it (single locked op).
+
+        Returns None when the collector is empty and would block forever
+        (caller should poll again).
+        """
         with self._lock:
             if not self._buf:
-                return False
+                self._ready.clear()
+                return None
             if len(self._buf) >= self.max_batch:
-                return True
+                return self._do_flush()
             if self._first_added_at is not None and \
                     time.time() - self._first_added_at > self.timeout:
-                return True
-            return False
+                if len(self._buf) >= self.min_batch:
+                    return self._do_flush()
+            return None
 
-    def flush(self) -> List[dict]:
-        with self._lock:
-            batch = self._buf
-            self._buf = []
-            self._first_added_at = None
-            return batch
+    def _do_flush(self) -> List[dict]:
+        batch = self._buf
+        self._buf = []
+        self._first_added_at = None
+        self._ready.clear()
+        return batch
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._buf)
 
+    @property
+    def ready_event(self) -> threading.Event:
+        return self._ready
+
     def try_get_batch(self) -> Optional[List[dict]]:
         """Return a batch if ready, else None."""
-        if self.should_flush():
-            return self.flush()
-        return None
+        return self.get_batch()
+
+    # -- backward-compat aliases (used by tests) -----------------------
+    def should_flush(self) -> bool:
+        with self._lock:
+            return bool(self._buf) and (
+                len(self._buf) >= self.max_batch or
+                (self._first_added_at is not None and time.time() - self._first_added_at > self.timeout)
+            )
+
+    def flush(self) -> List[dict]:
+        with self._lock:
+            return self._do_flush()

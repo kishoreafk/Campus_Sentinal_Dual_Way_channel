@@ -61,18 +61,17 @@ class AlertManager:
             metadata={"event_id": event.event_id, "is_interaction": event.is_interaction},
         )
 
-        # Write clip (best-effort — don't fail the alert if clip write fails)
-        try:
-            if self.clip_writer is not None:
-                clip_path = self.clip_writer.write_clip(
+        # Write clip asynchronously (non-blocking)
+        if self.clip_writer is not None:
+            try:
+                self.clip_writer.write_clip_async(
                     camera_id=event.camera_id,
                     alert_timestamp=event.timestamp,
                     alert_id=alert.alert_id,
                     action_label=event.action_type,
                 )
-                alert.clip_path = clip_path
-        except Exception as e:
-            logger.error(f"Clip write failed for alert {alert.alert_id}: {e}")
+            except Exception as e:
+                logger.error(f"Async clip write failed for alert {alert.alert_id}: {e}")
 
         # Persist
         if self._db is not None:

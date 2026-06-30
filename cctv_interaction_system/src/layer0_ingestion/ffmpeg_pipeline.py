@@ -45,12 +45,17 @@ def build_ffmpeg_cmd(
     use_hwaccel: bool = True,
     rtsp_transport: str = "tcp",
 ) -> list[str]:
-    """Build the FFmpeg command for RTSP ingestion."""
+    """Build the FFmpeg command for RTSP ingestion.
+
+    When hardware acceleration is enabled, the pipeline decodes on the GPU
+    then downloads to system memory so the output can be read via stdout.
+    """
     cmd: list[str] = ["ffmpeg", "-loglevel", "warning"]
     if use_hwaccel:
+        # Decode on GPU, then download to system memory for pipe output
         cmd += [
             "-hwaccel", "cuda",
-            "-hwaccel_output_format", "cuda",
+            "-hwaccel_output_format", "nv12",
             "-c:v", "h264_cuvid",
         ]
     cmd += [
@@ -154,9 +159,14 @@ class FFmpegPipeline:
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             bufsize=self.bufsize,
         )
+        # Quick health check — crash if process dies within 1s of launch
+        time.sleep(0.1)
+        if self._proc.poll() is not None:
+            stderr = self._proc.stderr.read(2048) if self._proc.stderr else b""
+            raise RuntimeError(f"FFmpeg died on startup: {stderr.decode(errors='replace')[:500]}")
 
     def start(self) -> None:
         self._start()
@@ -164,6 +174,12 @@ class FFmpegPipeline:
     def read_frame(self) -> Optional[np.ndarray]:
         """Read one BGR frame. Returns None on EOF / error."""
         if self._proc is None or self._proc.stdout is None:
+            return None
+        # Quick health check before reading
+        if self._proc.poll() is not None:
+            stderr = self._proc.stderr.read(2048) if self._proc.stderr else b""
+            logger.warning(f"[{self.camera_id}] FFmpeg exited unexpectedly: "
+                           f"{stderr.decode(errors='replace')[:300]}")
             return None
         raw = self._proc.stdout.read(self._frame_size)
         if not raw or len(raw) < self._frame_size:
